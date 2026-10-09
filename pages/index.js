@@ -1,447 +1,439 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { getDemoUser, clearDemoUser } from '../lib/demoAuth';
+import { useRouter } from 'next/router';
+import mockTests from '../lib/mockTestCatalog';
+import { getAttemptHistory } from '../lib/attemptHistory';
+import { isSupabaseConfigured, supabase } from '../lib/supabaseClient';
 
-const sampleTests = [
-  {
-    id: 1,
-    title: 'Free Diagnostic Test',
-    description: 'A 25-question starter test to understand your preparation level.',
-    is_free: true,
-    score: '82/100',
-    bundle_id: null,
-    time: '25 mins',
-    difficulty: 'Beginner',
-  },
-  {
-    id: 2,
-    title: 'Quant Sprint Series',
-    description: 'High-priority arithmetic and logic questions with timed practice.',
-    is_free: false,
-    score: 'Leadership',
-    bundle_id: 'bundle-1',
-    time: '45 mins',
-    difficulty: 'Intermediate',
-  },
-  {
-    id: 3,
-    title: 'Reasoning Mastery',
-    description: 'A focused reasoning pack for pattern recognition and accuracy.',
-    is_free: false,
-    bundle_id: 'bundle-2',
-    score: 'Top 10%',
-    time: '50 mins',
-    difficulty: 'Advanced',
-  },
+const levelIcons = { 'class-10': '◈', 'class-12': '✳', graduate: '✦' };
+const attemptLevels = [
+  { value: '10th', label: '10th based level' },
+  { value: 'inter', label: 'Inter based level' },
+  { value: 'graduate', label: 'Graduate level' },
 ];
 
-const testimonials = [
-  { name: 'Riya S.', text: 'The free mock test showed me exactly where I needed to improve. The scoring breakdown is very clear and actionable.' },
-  { name: 'Amit K.', text: 'I booked the premium bundle and used the timed tests every evening. My confidence increased noticeably within two weeks.' },
-  { name: 'Priya M.', text: 'The test series feels realistic and the explanations are crisp. It feels like a proper prep dashboard for serious candidates.' },
-];
+function getAttemptLevel(level = '') {
+  const normalized = level.toLowerCase();
+  if (normalized.includes('10') || normalized.includes('matric')) return '10th';
+  if (normalized.includes('12') || normalized.includes('inter')) return 'inter';
+  if (normalized.includes('grad')) return 'graduate';
+  return '';
+}
 
 export default function Home() {
-  const [tests, setTests] = useState(sampleTests);
-  const [purchasedBundles, setPurchasedBundles] = useState([]);
+  const router = useRouter();
   const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [adminTests, setAdminTests] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [levelFilter, setLevelFilter] = useState('');
+  const [selectedAttempt, setSelectedAttempt] = useState(null);
+  const [loadingAttemptId, setLoadingAttemptId] = useState('');
+  const [attemptError, setAttemptError] = useState('');
+  const [purchasedBundles, setPurchasedBundles] = useState([]);
+  const [loadingTests, setLoadingTests] = useState(true);
+  const [dataError, setDataError] = useState('');
 
-  useEffect(() => {
-    const currentUser = getDemoUser();
-    setUser(currentUser);
+  const loadDashboardData = useCallback(async (activeUser) => {
+    setLoadingTests(true);
+    setAttemptError('');
+    const localHistory = activeUser
+      ? getAttemptHistory(activeUser.email).filter((attempt) => mockTests.some((test) => test.id === attempt.testId))
+      : [];
+    setHistory(localHistory);
+    setSelectedAttempt(null);
+    setPurchasedBundles([]);
+    if (!isSupabaseConfigured) {
+      setDataError('Community papers are unavailable because the Supabase anon key is missing or invalid. Set a valid NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local and restart the app.');
+      setAdminTests([]);
+      setLoadingTests(false);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('tests')
+      .select('id,title,description,duration_minutes,level,is_free,bundle_id,bundles(id,name,price_paise)')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      const missingTestsTable = error.code === 'PGRST205'
+        || /could not find the table ['"]?public\.tests['"]? in the schema cache/i.test(error.message || '');
+      setDataError(missingTestsTable
+        ? 'The Supabase database tables are not installed yet (public.tests is missing). In your Supabase project, open SQL Editor, paste and run the full supabase-schema.sql file from this project. Then reload the dashboard. If you already ran it, confirm this app uses the same Supabase project URL and run: NOTIFY pgrst, \'reload schema\';'
+        : `Community question papers could not be loaded: ${error.message}`);
+      setAdminTests([]);
+      setLoadingTests(false);
+      return;
+    }
+    setDataError('');
+    setAdminTests(data || []);
+
+    if (activeUser) {
+      const { data: purchases, error: purchaseError } = await supabase
+        .from('purchases')
+        .select('bundle_id')
+        .eq('user_id', activeUser.id)
+        .eq('status', 'success');
+      if (purchaseError) {
+        setDataError(`Test series loaded, but purchase access could not be checked: ${purchaseError.message}`);
+      } else {
+        setPurchasedBundles([...new Set((purchases || []).map((purchase) => purchase.bundle_id))]);
+      }
+
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session?.access_token) {
+        setAttemptError(`Your attempted tests could not be loaded: ${sessionError?.message || 'Your sign-in session has expired.'}`);
+      } else {
+        try {
+          const response = await fetch('/api/attempts', {
+            headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+          });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || 'Attempt history could not be loaded.');
+          const localMockAttempts = localHistory
+            .filter((attempt) => mockTests.some((test) => test.id === attempt.testId))
+            .map((attempt) => ({
+              ...attempt,
+              id: attempt.id || `local-${attempt.testId}-${attempt.submittedAt}`,
+              level: attempt.level || mockTests.find((test) => test.id === attempt.testId)?.level || '',
+              source: 'local',
+            }));
+          setHistory([...localMockAttempts, ...(payload.attempts || [])].sort(
+            (left, right) => new Date(right.submittedAt).getTime() - new Date(left.submittedAt).getTime()
+          ));
+          setAttemptError('');
+        } catch (historyError) {
+          setAttemptError(`Your attempted tests could not be loaded: ${historyError.message}`);
+        }
+      }
+    }
+    setLoadingTests(false);
   }, []);
 
-  const isUnlocked = (test) => test.is_free || purchasedBundles.includes(test.bundle_id);
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      setLoadingTests(false);
+      setAuthReady(true);
+      return undefined;
+    }
+
+    let active = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) setDataError(`Your session could not be checked: ${error.message}`);
+      const currentUser = data?.session?.user || null;
+      setUser(currentUser);
+      setAuthReady(true);
+      loadDashboardData(currentUser);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+      loadDashboardData(session?.user || null);
+    });
+
+    return () => {
+      active = false;
+      authListener.subscription.unsubscribe();
+    };
+  }, [loadDashboardData]);
+
+  const recentAttempt = history[0];
+  const filteredAttempts = useMemo(() => (
+    levelFilter ? history.filter((attempt) => getAttemptLevel(attempt.level) === levelFilter) : history
+  ), [history, levelFilter]);
+  const averageScore = useMemo(() => {
+    if (!filteredAttempts.length) return 0;
+    return Math.round(filteredAttempts.reduce((sum, attempt) => (
+      sum + (attempt.total ? (attempt.score / attempt.total) * 100 : 0)
+    ), 0) / filteredAttempts.length);
+  }, [filteredAttempts]);
+  const bestScore = filteredAttempts.length
+    ? Math.max(...filteredAttempts.map((attempt) => (
+      attempt.total ? Math.round((attempt.score / attempt.total) * 100) : 0
+    )))
+    : 0;
+
+  const openAttempt = async (attempt) => {
+    if (selectedAttempt?.id === attempt.id) {
+      setSelectedAttempt(null);
+      return;
+    }
+    setAttemptError('');
+    setSelectedAttempt(null);
+    if (attempt.source === 'local') {
+      setSelectedAttempt(attempt);
+      return;
+    }
+
+    setLoadingAttemptId(attempt.id);
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session?.access_token) {
+        throw new Error(sessionError?.message || 'Your sign-in session has expired.');
+      }
+      const response = await fetch(`/api/attempts/${encodeURIComponent(attempt.id)}`, {
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || 'The attempted paper could not be loaded.');
+      setSelectedAttempt(payload.attempt);
+    } catch (detailError) {
+      setAttemptError(`The attempted paper could not be loaded: ${detailError.message}`);
+    } finally {
+      setLoadingAttemptId('');
+    }
+  };
+
+  const logout = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) setDataError(`Sign out failed: ${error.message}`);
+    else {
+      setUser(null);
+      setHistory([]);
+      setSelectedAttempt(null);
+      setAttemptError('');
+      router.push('/');
+    }
+  };
+
+  const allTests = [
+    ...mockTests.map((test) => ({ ...test, local: true })),
+    ...adminTests,
+  ];
 
   return (
-    <div style={styles.page}>
-      <div style={styles.container}>
-        <header style={styles.header}>
-          <div>
-            <div style={styles.brand}>Prajval Spark</div>
-            <h1 style={styles.title}>Exam prep that actually moves you forward.</h1>
-          </div>
-          {!user ? (
-            <div style={styles.authButtons}>
-              <Link href="/login" style={styles.secondaryButton}>Login</Link>
-              <Link href="/signup" style={styles.primaryButton}>Create account</Link>
-            </div>
+    <div className="shell">
+      <header className="topbar">
+        <Link href="/" className="brand-mark"><span className="brand-symbol">✦</span> Prajval Spark</Link>
+        <nav className="topbar-actions" aria-label="Main navigation">
+          {user ? (
+            <>
+              <Link className="topbar-link" href="/queries">Queries & expert</Link>
+              <Link className="topbar-link" href="/admin">Admin</Link>
+              <span className="user-chip">{user.email}</span>
+              <button className="button button-ghost" type="button" onClick={logout}>Sign out</button>
+            </>
           ) : (
-            <div style={styles.authButtons}>
-              <div style={styles.userBadge}>{user.email}</div>
-              <button
-                type="button"
-                onClick={() => {
-                  clearDemoUser();
-                  setUser(null);
-                }}
-                style={styles.logoutButton}
-              >
-                Logout
-              </button>
+            <>
+              <Link className="topbar-link" href="/login">Sign in</Link>
+              <Link className="button button-primary" href="/signup">Get started</Link>
+            </>
+          )}
+        </nav>
+      </header>
+
+      <main className="page-wrap">
+        {dataError && <div className="inline-alert" role="alert">{dataError}</div>}
+        <section className="dashboard-hero">
+          <div className="hero-copy">
+            <div className="eyebrow">{user ? 'YOUR PREPARATION SPACE' : 'PRACTICE WITH PURPOSE'}</div>
+            <h1 className="hero-title">{user ? `Welcome${user.email ? `, ${user.email.split('@')[0]}` : ' back'}.` : 'A clearer path to your next rank.'}</h1>
+            <p className="hero-description">
+              {user
+                ? 'Choose a mock at your level, review every solution, and turn your practice into progress.'
+                : 'Explore free and premium test series. Sign in to save your results, unlock purchased papers, and ask the community.'}
+            </p>
+            {!user && (
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 22 }}>
+                <Link className="button button-primary" href="/login">Sign in</Link>
+                <Link className="button button-ghost" href="/signup">Create free account</Link>
+              </div>
+            )}
+          </div>
+          <div className="hero-stat">
+            <div className="hero-stat-label">Latest mock score</div>
+            <div className="hero-stat-value">{recentAttempt ? `${Math.round((recentAttempt.score / recentAttempt.total) * 100)}%` : '—'}</div>
+            <div className="hero-stat-caption">{recentAttempt ? recentAttempt.testTitle : 'Your first result will appear here'}</div>
+          </div>
+        </section>
+
+        <section aria-label="Your progress">
+          <div className="section-heading">
+            <div><h2>Your progress</h2><p>Review the tests you have attempted and track your performance by level.</p></div>
+            <label className="attempt-filter">
+              <span>Filter by level</span>
+              <select value={levelFilter} onChange={(event) => { setLevelFilter(event.target.value); setSelectedAttempt(null); }}>
+                <option value="">All attempted tests</option>
+                {attemptLevels.map((level) => <option key={level.value} value={level.value}>{level.label}</option>)}
+              </select>
+            </label>
+          </div>
+          {attemptError && <div className="inline-alert" role="alert">{attemptError}</div>}
+          {levelFilter && (
+            <div className="metric-grid attempt-metric-grid">
+              <div className="metric-card"><div className="metric-label">Tests attempted</div><div className="metric-value">{filteredAttempts.length}</div><div className="metric-note">At this level</div></div>
+              <div className="metric-card"><div className="metric-label">Average score</div><div className="metric-value">{filteredAttempts.length ? `${averageScore}%` : '—'}</div><div className="metric-note">Across attempts at this level</div></div>
+              <div className="metric-card"><div className="metric-label">Best score</div><div className="metric-value">{filteredAttempts.length ? `${bestScore}%` : '—'}</div><div className="metric-note">Your personal best at this level</div></div>
             </div>
           )}
-        </header>
-
-        <section style={styles.heroCard}>
-          <div>
-            <div style={styles.kicker}>Free Test</div>
-            <h2 style={styles.heroTitle}>Sample Free Test</h2>
-            <p style={styles.heroDescription}>Take the first test of the week and see your score instantly with detailed accuracy analytics.</p>
-            <div style={styles.heroMeta}>
-              <span>25 Questions</span>
-              <span>•</span>
-              <span>25 mins</span>
-              <span>•</span>
-              <span>Beginner</span>
+          {loadingTests ? (
+            <div className="empty-state">Loading your attempted tests…</div>
+          ) : filteredAttempts.length ? (
+            <div className="attempt-list">
+              {filteredAttempts.map((attempt) => {
+                const percentage = attempt.total ? Math.round((attempt.score / attempt.total) * 100) : 0;
+                return (
+                  <button
+                    className={`attempt-card ${selectedAttempt?.id === attempt.id ? 'attempt-card-selected' : ''}`}
+                    key={attempt.id}
+                    type="button"
+                    aria-pressed={selectedAttempt?.id === attempt.id}
+                    onClick={() => openAttempt(attempt)}
+                    disabled={loadingAttemptId === attempt.id}
+                  >
+                    <span className="attempt-card-copy">
+                      <strong>{attempt.testTitle}</strong>
+                      <small>{attempt.level} · {attempt.submittedAt ? new Date(attempt.submittedAt).toLocaleString() : 'Date unavailable'}</small>
+                    </span>
+                    <span className="attempt-card-score">{percentage}%<small>{attempt.score}/{attempt.total} marks</small></span>
+                    <span className="attempt-card-action">{loadingAttemptId === attempt.id ? 'Loading…' : selectedAttempt?.id === attempt.id ? 'Close review' : 'Review paper →'}</span>
+                  </button>
+                );
+              })}
             </div>
-          </div>
-
-          <div style={styles.scoreCard}>
-            <div style={styles.scoreLabel}>Last score</div>
-            <div style={styles.scoreValue}>82/100</div>
-            <div style={styles.scoreTrend}>+12% this week</div>
-          </div>
-        </section>
-
-        <section style={styles.metricsRow}>
-          <div style={styles.metricBox}><span style={styles.metricTitle}>Attempted Tests</span><strong>24</strong></div>
-          <div style={styles.metricBox}><span style={styles.metricTitle}>Average Score</span><strong>84%</strong></div>
-          <div style={styles.metricBox}><span style={styles.metricTitle}>Accuracy</span><strong>78%</strong></div>
-          <div style={styles.metricBox}><span style={styles.metricTitle}>Rank</span><strong>#132</strong></div>
-        </section>
-
-        <section style={styles.sectionBlock}>
-          <div style={styles.sectionHeader}>
-            <h3 style={styles.sectionTitle}>Popular test series</h3>
-          </div>
-
-          <div style={styles.testGrid}>
-            {tests.map((test) => (
-              <div key={test.id} style={styles.testCard}>
-                <div style={styles.testHeader}>
-                  <div>
-                    <div style={styles.testTag}>{test.is_free ? 'Free' : 'Premium'}</div>
-                    <h4 style={styles.testTitle}>{test.title}</h4>
+          ) : (
+            <div className="empty-state">
+              {history.length
+                ? 'No attempted tests match this level yet.'
+                : 'No tests attempted yet. Complete a mock test and it will appear here.'}
+            </div>
+          )}
+          {selectedAttempt && (
+            <section className="attempt-detail" aria-label="Attempted paper review">
+              <div className="section-heading">
+                <div><div className="eyebrow">ATTEMPT REVIEW · {selectedAttempt.level}</div><h2>{selectedAttempt.testTitle}</h2><p>Complete paper, your answers, correct answers, and performance analysis.</p></div>
+                <button className="button button-ghost" type="button" onClick={() => setSelectedAttempt(null)}>Close review</button>
+              </div>
+              {selectedAttempt.answerKey?.length ? (
+                <>
+                  <div className="result-metrics">
+                    <article><span>Score</span><strong>{selectedAttempt.score}/{selectedAttempt.total} ({selectedAttempt.total ? Math.round((selectedAttempt.score / selectedAttempt.total) * 100) : 0}%)</strong></article>
+                    <article><span>Accuracy</span><strong>{selectedAttempt.accuracy ?? '—'}%</strong></article>
+                    <article><span>Correct</span><strong>{selectedAttempt.correct ?? '—'}</strong></article>
+                    <article><span>Incorrect</span><strong>{selectedAttempt.wrong ?? '—'}</strong></article>
+                    <article><span>Not answered</span><strong>{selectedAttempt.unanswered ?? '—'}</strong></article>
                   </div>
-                  <span style={styles.testDifficulty}>{test.difficulty}</span>
-                </div>
+                  {selectedAttempt.sectionBreakdown?.length > 0 && (
+                    <section className="results-section">
+                      <div className="section-heading"><div><h3>Section analysis</h3><p>Your score by subject area.</p></div></div>
+                      <div className="result-sections">
+                        {selectedAttempt.sectionBreakdown.map((section) => (
+                          <article className="result-section-card" key={section.section}>
+                            <span>{section.section}</span><strong>{section.score}<small>/{section.total}</small></strong>
+                            <div className="result-progress"><i style={{ width: `${section.total ? (section.score / section.total) * 100 : 0}%` }} /></div>
+                            <small>{section.correct} correct</small>
+                          </article>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                  <div className="answer-list">
+                    {selectedAttempt.answerKey.map((question, index) => {
+                      const selectedIndex = ['a', 'b', 'c', 'd'].indexOf(question.selected_option);
+                      const correctIndex = ['a', 'b', 'c', 'd'].indexOf(question.correct_option);
+                      const correct = selectedIndex >= 0 && selectedIndex === correctIndex;
+                      return (
+                        <article className="answer-review" key={question.id}>
+                          <div className="answer-review-top">
+                            <span>Q{index + 1} · {question.section} · {question.marks} {question.marks === 1 ? 'mark' : 'marks'}</span>
+                            <strong className={correct ? 'answer-correct' : 'answer-incorrect'}>{correct ? 'Correct' : selectedIndex < 0 ? 'Not answered' : 'Incorrect'}</strong>
+                          </div>
+                          <p className="answer-question">{question.question_text}</p>
+                          <div className="answer-options">
+                            {question.options.map((option, optionIndex) => (
+                              <div key={`${question.id}-${optionIndex}`} className={`answer-option ${optionIndex === correctIndex ? 'answer-option-correct' : ''} ${optionIndex === selectedIndex && !correct ? 'answer-option-wrong' : ''}`}>
+                                <span>{String.fromCharCode(65 + optionIndex)}</span>{option}
+                                {optionIndex === correctIndex && <b>Correct answer</b>}
+                                {optionIndex === selectedIndex && <b>Your answer</b>}
+                              </div>
+                            ))}
+                          </div>
+                          <div className="answer-solution"><strong>Solution</strong><p>{question.explanation}</p></div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </>
+              ) : (
+                <div className="empty-state">This saved attempt does not include a question-by-question review. New attempts will include the full paper, your answers, and analysis.</div>
+              )}
+            </section>
+          )}
+        </section>
 
-                <p style={styles.testDescription}>{test.description}</p>
+        <section aria-labelledby="mock-heading">
+          <div className="section-heading">
+            <div><h2 id="mock-heading">All test series</h2><p>Browse every free mock and premium paper available for your exam journey.</p></div>
+          </div>
+          <div className="level-grid">
+            {allTests.map((test) => {
+              const local = test.local;
+              const duration = local ? test.duration : test.duration_minutes;
+              const isUnlocked = test.is_free || purchasedBundles.includes(test.bundle_id);
+              const bundle = Array.isArray(test.bundles) ? test.bundles[0] : test.bundles;
+              const actionHref = !user
+                ? `/login?next=${encodeURIComponent(isUnlocked ? `/test/${test.id}` : `/bundle/${test.bundle_id || ''}`)}`
+                : isUnlocked
+                  ? `/test/${test.id}`
+                  : `/bundle/${test.bundle_id || ''}`;
+              const actionLabel = !user
+                ? 'Sign in to access →'
+                : isUnlocked
+                  ? (test.is_free ? 'Start free mock →' : 'Start test →')
+                  : `Unlock${bundle?.price_paise ? ` · ₹${bundle.price_paise / 100}` : ''} →`;
+              return (
+                <article className="level-card" key={test.id}>
+                  <div className="level-icon">{levelIcons[test.id] || '✦'}</div>
+                  <div className={`level-pill ${test.is_free ? '' : 'premium-pill'}`}>{test.is_free ? 'Free mock' : 'Premium series'}</div>
+                  <h3>{test.title}</h3>
+                  <p>{test.description || 'A focused free mock test with clear solutions and performance insights.'}</p>
+                  <div className="level-meta">
+                    <span>{local ? test.questionCount : 'Question paper'}</span>
+                    <span>{duration || 30} min</span>
+                    {bundle?.name && <span>{bundle.name}</span>}
+                  </div>
+                  <Link
+                    className={`button ${isUnlocked ? 'button-primary' : 'button-soft'} level-action`}
+                    href={actionHref}
+                  >
+                    {actionLabel}
+                  </Link>
+                </article>
+              );
+            })}
+          </div>
+          {loadingTests && <div className="empty-state" style={{ marginTop: 14 }}>Loading published test series…</div>}
+          {!loadingTests && !dataError && allTests.length === mockTests.length && (
+            <div className="empty-state" style={{ marginTop: 14 }}>No admin-created series yet. The free government exam mocks above are ready to start.</div>
+          )}
+        </section>
 
-                <div style={styles.testMeta}>
-                  <span>{test.time}</span>
-                  <span>•</span>
-                  <span>{test.score}</span>
-                </div>
-
-                {isUnlocked(test) ? (
-                  <Link href={`/test/${test.id}`} style={styles.openButton}>Open test</Link>
-                ) : (
-                  <Link href={`/bundle/${test.bundle_id || 'demo'}`} style={styles.lockButton}>Unlock ₹199</Link>
-                )}
-              </div>
-            ))}
+        <section aria-labelledby="support-heading">
+          <div className="section-heading">
+            <div><h2 id="support-heading">You don’t have to prepare alone</h2><p>Ask the community or get personal guidance from an expert.</p></div>
+          </div>
+          <div className="feature-grid">
+            <article className="feature-card">
+              <div className="feature-icon" style={{ color: '#5555c9', background: '#f0f0ff' }}>◉</div>
+              <div className="feature-copy"><h3>Community queries</h3><p>Post a question, share what you’re working on, and learn with other aspirants.</p></div>
+              <Link className="feature-link" href={user ? '/queries?room=community' : '/login'}>Open chat →</Link>
+            </article>
+            <article className="feature-card">
+              <div className="feature-icon" style={{ color: '#21825a', background: '#eaf8f0' }}>✦</div>
+              <div className="feature-copy"><h3>Chat with an expert</h3><p>Send your question directly to the expert team and get a focused reply.</p></div>
+              <Link className="feature-link" href={user ? '/queries?room=expert' : '/login'}>Ask an expert →</Link>
+            </article>
           </div>
         </section>
 
-        <section style={styles.sectionBlock}>
-          <div style={styles.sectionHeader}>
-            <h3 style={styles.sectionTitle}>Student testimonials</h3>
+        {!authReady && <div className="empty-state" style={{ marginTop: 18 }}>Checking your secure session…</div>}
+        {!isSupabaseConfigured && (
+          <div className="inline-alert" style={{ marginTop: 22 }}>
+            Email sign-in and shared features need Supabase configuration. Add the project URL and anon key to the app environment; your free mock previews are ready in the meantime.
           </div>
-
-          <div style={styles.testimonialGrid}>
-            {testimonials.map((item) => (
-              <div key={item.name} style={styles.testimonialCard}>
-                <div style={styles.stars}>★★★★★</div>
-                <p style={styles.testimonialText}>“{item.text}”</p>
-                <strong style={styles.personName}>{item.name}</strong>
-              </div>
-            ))}
-          </div>
-        </section>
-      </div>
+        )}
+      </main>
     </div>
   );
 }
-
-const styles = {
-  page: {
-    minHeight: '100vh',
-    background: 'linear-gradient(180deg, #f8fbff 0%, #eef9ff 100%)',
-    padding: '32px 20px 60px',
-    fontFamily: 'Inter, Arial, sans-serif',
-  },
-  container: {
-    maxWidth: 1200,
-    margin: '0 auto',
-  },
-  header: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    gap: 16,
-    marginBottom: 28,
-    flexWrap: 'wrap',
-  },
-  brand: {
-    display: 'inline-block',
-    fontWeight: 800,
-    fontSize: 13,
-    letterSpacing: 1.5,
-    textTransform: 'uppercase',
-    color: '#2563eb',
-    marginBottom: 8,
-  },
-  title: {
-    margin: 0,
-    fontSize: 'clamp(2rem, 4vw, 3.2rem)',
-    lineHeight: 1.1,
-    color: '#0f172a',
-    maxWidth: 700,
-  },
-  authButtons: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 12,
-  },
-  primaryButton: {
-    background: 'linear-gradient(135deg, #2563eb 0%, #7c3aed 100%)',
-    color: '#fff',
-    textDecoration: 'none',
-    borderRadius: 12,
-    padding: '12px 18px',
-    fontWeight: 700,
-  },
-  secondaryButton: {
-    background: '#fff',
-    color: '#0f172a',
-    textDecoration: 'none',
-    border: '1px solid #dfe7f3',
-    borderRadius: 12,
-    padding: '12px 18px',
-    fontWeight: 700,
-  },
-  userBadge: {
-    background: '#ecfdf5',
-    color: '#065f46',
-    borderRadius: 999,
-    padding: '9px 14px',
-    fontWeight: 700,
-    maxWidth: 220,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-  },
-  logoutButton: {
-    background: '#fff1f2',
-    color: '#be123c',
-    border: '1px solid #fecdd3',
-    borderRadius: 12,
-    padding: '10px 14px',
-    fontWeight: 700,
-    cursor: 'pointer',
-  },
-  heroCard: {
-    background: 'linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%)',
-    color: '#fff',
-    borderRadius: 28,
-    padding: '36px 32px',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    gap: 24,
-    marginBottom: 26,
-    boxShadow: '0 20px 50px rgba(37, 99, 235, 0.18)',
-    flexWrap: 'wrap',
-  },
-  kicker: {
-    display: 'inline-block',
-    background: 'rgba(255,255,255,0.12)',
-    border: '1px solid rgba(255,255,255,0.15)',
-    borderRadius: 999,
-    padding: '8px 12px',
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-    fontWeight: 700,
-  },
-  heroTitle: {
-    margin: '12px 0 10px',
-    fontSize: 38,
-  },
-  heroDescription: {
-    margin: 0,
-    maxWidth: 620,
-    color: 'rgba(255,255,255,0.8)',
-    lineHeight: 1.7,
-    fontSize: 17,
-  },
-  heroMeta: {
-    marginTop: 16,
-    display: 'flex',
-    gap: 12,
-    flexWrap: 'wrap',
-    color: 'rgba(255,255,255,0.8)',
-    fontWeight: 600,
-  },
-  scoreCard: {
-    background: 'rgba(255,255,255,0.08)',
-    border: '1px solid rgba(255,255,255,0.16)',
-    borderRadius: 18,
-    padding: '20px 22px',
-    minWidth: 180,
-  },
-  scoreLabel: {
-    fontSize: 12,
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-    color: 'rgba(255,255,255,0.75)',
-  },
-  scoreValue: {
-    fontSize: 40,
-    fontWeight: 800,
-    margin: '8px 0',
-  },
-  scoreTrend: {
-    color: '#bbf7d0',
-    fontWeight: 700,
-  },
-  metricsRow: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-    gap: 16,
-    marginBottom: 28,
-  },
-  metricBox: {
-    background: '#fff',
-    border: '1px solid #e2e8f0',
-    borderRadius: 18,
-    padding: '18px 20px',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 10,
-    boxShadow: '0 8px 22px rgba(15, 23, 42, 0.03)',
-  },
-  metricTitle: {
-    color: '#64748b',
-    fontSize: 13,
-  },
-  sectionBlock: {
-    marginTop: 30,
-  },
-  sectionHeader: {
-    marginBottom: 18,
-  },
-  sectionTitle: {
-    margin: 0,
-    fontSize: 30,
-    color: '#0f172a',
-  },
-  testGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-    gap: 18,
-  },
-  testCard: {
-    background: '#fff',
-    border: '1px solid #e2e8f0',
-    borderRadius: 20,
-    padding: 22,
-    boxShadow: '0 12px 22px rgba(15, 23, 42, 0.04)',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 14,
-  },
-  testHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    gap: 12,
-    alignItems: 'flex-start',
-  },
-  testTag: {
-    display: 'inline-block',
-    borderRadius: 999,
-    padding: '6px 10px',
-    background: '#ecfeff',
-    color: '#0f766e',
-    fontSize: 11,
-    fontWeight: 700,
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
-  testTitle: {
-    margin: '10px 0 0',
-    fontSize: 22,
-    color: '#0f172a',
-  },
-  testDifficulty: {
-    background: '#f1f5f9',
-    borderRadius: 999,
-    padding: '7px 10px',
-    fontSize: 11,
-    color: '#475569',
-    fontWeight: 700,
-  },
-  testDescription: {
-    margin: 0,
-    color: '#475569',
-    lineHeight: 1.7,
-    minHeight: 70,
-  },
-  testMeta: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 10,
-    color: '#334155',
-    fontWeight: 600,
-    fontSize: 14,
-  },
-  openButton: {
-    display: 'block',
-    marginTop: 'auto',
-    background: '#0f172a',
-    color: '#fff',
-    textDecoration: 'none',
-    borderRadius: 12,
-    padding: '12px 16px',
-    textAlign: 'center',
-    fontWeight: 700,
-  },
-  lockButton: {
-    display: 'block',
-    marginTop: 'auto',
-    background: 'linear-gradient(135deg, #fbbf24 0%, #f97316 100%)',
-    color: '#fff',
-    textDecoration: 'none',
-    borderRadius: 12,
-    padding: '12px 16px',
-    textAlign: 'center',
-    fontWeight: 700,
-  },
-  testimonialGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-    gap: 18,
-  },
-  testimonialCard: {
-    background: '#fff',
-    border: '1px solid #e2e8f0',
-    borderRadius: 18,
-    padding: 22,
-  },
-  stars: {
-    color: '#f59e0b',
-    letterSpacing: 1,
-    marginBottom: 12,
-  },
-  testimonialText: {
-    margin: '0 0 18px',
-    color: '#475569',
-    lineHeight: 1.7,
-  },
-  personName: {
-    fontSize: 15,
-    color: '#0f172a',
-  },
-};

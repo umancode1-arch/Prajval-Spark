@@ -35,6 +35,12 @@ Only a project owner with SQL editor access can provision administrators. The ad
 
 Accounts created with the previous email-code flow may not have a password yet. Use **Forgot password?** on the sign-in page to set one.
 
+## Import questions from a document
+
+Set the server-only `OPENROUTER_API_KEY` in `.env.local` and restart the app. For compatibility, the importer also accepts the existing lowercase `api_key` environment variable. The default model is `openai/gpt-4o-mini`; set `OPENROUTER_MODEL` to use a different OpenRouter model. Administrators can upload text-based PDF or `.docx` files from the question paper builder. The importer extracts questions, section names, four answer choices, and answer keys into editable drafts; it does not publish the paper automatically. AI-inferred answers are flagged for review. Set the duration in minutes for the whole mock before publishing.
+
+Uploads are limited to 10 MB and 300,000 extracted text characters. Larger documents within that limit are split into smaller overlapping excerpts before being sent to OpenRouter, then duplicate boundary questions are removed. TET papers use the section names **Telugu**, **English**, and **Child Development and Pedagogy**; option labels such as `A.` are removed because the test interface displays the choice labels separately. Scanned PDFs need OCR first; legacy `.doc` files are not supported. The document text is sent to OpenRouter for extraction, so only upload content you have permission to use.
+
 ## Practice and support
 
 The dashboard includes free 10th-pass, 12th-pass, and graduate mock tests. Questions are served without answer keys; the authenticated grading endpoint returns the score, metrics, answer key, and solutions only after submission. Attempts for database-backed papers are stored in Supabase. Local-device mock history is associated with the verified email in that browser.

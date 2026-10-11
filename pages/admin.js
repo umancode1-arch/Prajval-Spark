@@ -29,6 +29,9 @@ export default function AdminPage() {
   const [bundleId, setBundleId] = useState('');
   const [questions, setQuestions] = useState([blankQuestion()]);
   const [busy, setBusy] = useState(false);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadAuthorized, setUploadAuthorized] = useState(false);
+  const [extracting, setExtracting] = useState(false);
   const [authMode, setAuthMode] = useState('login');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -94,6 +97,65 @@ export default function AdminPage() {
       options[optionIndex] = value;
       return { ...question, options };
     }));
+  };
+
+  const extractQuestions = async () => {
+    setError('');
+    setNotice('');
+    if (!uploadFile) {
+      setError('Choose a PDF or .docx file first.');
+      return;
+    }
+    if (!uploadAuthorized) {
+      setError('Confirm that you have permission to use the uploaded document before extracting its questions.');
+      return;
+    }
+
+    setExtracting(true);
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session?.access_token) {
+        throw new Error(sessionError?.message || 'Your sign-in expired. Please sign in again.');
+      }
+
+      const formData = new FormData();
+      formData.append('document', uploadFile);
+      const response = await fetch('/api/admin/extract-questions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+        body: formData,
+      });
+      const responseText = await response.text();
+      let payload;
+      try {
+        payload = JSON.parse(responseText);
+      } catch {
+        const detail = responseText.trimStart().startsWith('<')
+          ? `The server returned an HTML error page (HTTP ${response.status}). Restart the development server and try again.`
+          : `The server returned an unreadable response (HTTP ${response.status}).`;
+        throw new Error(detail);
+      }
+      if (!response.ok) throw new Error(payload.error || 'Questions could not be extracted.');
+
+      const importedQuestions = payload.questions.map((question) => ({
+        ...question,
+        marks: 1,
+      }));
+      setQuestions(importedQuestions);
+      setTitle((current) => current.trim() || payload.title || uploadFile.name.replace(/\.[^.]+$/, ''));
+      const inferredCount = importedQuestions.filter((question) => question.answer_source === 'inferred').length;
+      setNotice(
+        `${importedQuestions.length} question${importedQuestions.length === 1 ? '' : 's'} extracted. Review every question and correct answer before publishing.`
+        + (payload.skippedQuestionNumbers?.length
+          ? ` Skipped ${payload.skippedQuestionNumbers.length} incomplete item${payload.skippedQuestionNumbers.length === 1 ? '' : 's'} from the extraction (items ${payload.skippedQuestionNumbers.join(', ')}); check the source document and add those questions manually if needed.`
+          : '')
+        + (inferredCount ? ` ${inferredCount} answer${inferredCount === 1 ? ' was' : 's were'} inferred because the document did not provide an answer key.` : '')
+      );
+    } catch (extractError) {
+      setError(extractError.message);
+    } finally {
+      setExtracting(false);
+    }
   };
 
   const createQuestionPaper = async (event) => {
@@ -239,7 +301,7 @@ export default function AdminPage() {
               <select id="paper-level" className="admin-field" value={level} onChange={(event) => setLevel(event.target.value)}>
                 {levelChoices.map((choice) => <option key={choice}>{choice}</option>)}
               </select>
-              <label className="field-label" htmlFor="paper-duration">Duration in minutes</label>
+              <label className="field-label" htmlFor="paper-duration">Duration for the whole mock (minutes)</label>
               <input id="paper-duration" className="admin-field" type="number" min="1" max="300" value={duration} onChange={(event) => setDuration(event.target.value)} required />
               <label className="field-label" htmlFor="paper-access">Access</label>
               <select id="paper-access" className="admin-field" value={isFree ? 'free' : 'premium'} onChange={(event) => setIsFree(event.target.value === 'free')}>
@@ -258,7 +320,7 @@ export default function AdminPage() {
                   )}
                 </>
               )}
-              <button className="button button-primary" type="submit" disabled={busy || !title.trim()}>{busy ? 'Publishing…' : 'Publish question paper'}</button>
+              <button className="button button-primary" type="submit" disabled={busy || extracting || !title.trim()}>{busy ? 'Publishing…' : 'Publish question paper'}</button>
             </form>
           </section>
 
@@ -267,6 +329,25 @@ export default function AdminPage() {
               <h2 style={{ margin: 0 }}>Questions <span style={{ color: '#8993a7', fontSize: 12 }}>({questions.length})</span></h2>
               <button className="button button-soft" type="button" onClick={() => setQuestions((current) => [...current, blankQuestion()])}>＋ Add question</button>
             </div>
+            <div className="question-import">
+              <strong>Import questions from a document</strong>
+              <p>Upload a text-based PDF or .docx. Questions, sections, choices, and answer keys will be extracted into editable drafts. Scanned PDFs need OCR first.</p>
+              <input
+                className="admin-field"
+                type="file"
+                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                aria-label="Choose a PDF or Word document"
+                onChange={(event) => setUploadFile(event.target.files?.[0] || null)}
+              />
+              {uploadFile && <small className="question-import-file">{uploadFile.name}</small>}
+              <label className="question-import-confirm">
+                <input type="checkbox" checked={uploadAuthorized} onChange={(event) => setUploadAuthorized(event.target.checked)} />
+                I have permission to use this document and send its text to the AI service for extraction.
+              </label>
+              <button className="button button-soft" type="button" disabled={extracting || busy || !uploadFile} onClick={extractQuestions}>
+                {extracting ? 'Extracting questions…' : 'Extract editable questions'}
+              </button>
+            </div>
             {questions.map((question, index) => (
               <article className="question-editor" key={`question-${index}`}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
@@ -274,8 +355,9 @@ export default function AdminPage() {
                   {questions.length > 1 && <button type="button" className="text-action" style={{ margin: 0 }} onClick={() => setQuestions((current) => current.filter((_, itemIndex) => itemIndex !== index))}>Remove</button>}
                 </div>
                 <select className="admin-field" aria-label={`Section for question ${index + 1}`} value={question.section} onChange={(event) => changeQuestion(index, { section: event.target.value })}>
-                  {sectionChoices.map((choice) => <option key={choice}>{choice}</option>)}
+                  {[...new Set([...sectionChoices, ...questions.map((item) => item.section)])].map((choice) => <option key={choice}>{choice}</option>)}
                 </select>
+                {question.answer_source === 'inferred' && <small className="question-answer-warning">AI-inferred answer · verify before publishing</small>}
                 <textarea className="admin-field" aria-label={`Question ${index + 1} text`} rows={2} value={question.question_text} onChange={(event) => changeQuestion(index, { question_text: event.target.value })} placeholder="Write the question…" />
                 <div className="admin-options-grid">
                   {question.options.map((option, optionIndex) => (

@@ -18,11 +18,31 @@ const sectionChoices = ['Quantitative Aptitude', 'Reasoning', 'General Awareness
 const addSectionHeadingOption = '__add_section_heading__';
 const removableMockTitle = 'AP SPECIAL TET 2026 (SET 1)';
 
+function normalizeSectionName(section) {
+  return String(section || '')
+    .trim()
+    .replace(/^(?:section|part|unit)\s+(?:[ivxlcdm]+|\d+|[a-z])\s*[:.)\-–—]?\s*/i, '')
+    .replace(/&/g, ' and ')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function uniqueSectionChoices(choices) {
+  const sections = new Map();
+  choices.filter(Boolean).forEach((section) => {
+    const key = normalizeSectionName(section);
+    if (key && !sections.has(key)) sections.set(key, section);
+  });
+  return [...sections.values()];
+}
+
 function hasIncompleteQuestionDraft(questions) {
   return !questions.length || questions.some((question) => (
     typeof question.sectionDraft === 'string'
     || !question.question_text.trim()
     || question.options.some((option) => !option.trim())
+    || !question.correct_option
     || !question.explanation.trim()
   ));
 }
@@ -187,19 +207,25 @@ export default function AdminPage() {
       }
       if (!response.ok) throw new Error(payload.error || 'Questions could not be extracted.');
 
-      const importedQuestions = payload.questions.map((question) => ({
-        ...question,
-        marks: 1,
-      }));
+      const availableSections = uniqueSectionChoices([
+        ...sectionChoices,
+        ...questions.map((question) => question.section),
+      ]);
+      const importedQuestions = payload.questions.map((question) => {
+        const section = availableSections.find(
+          (existingSection) => normalizeSectionName(existingSection) === normalizeSectionName(question.section),
+        ) || question.section;
+        return { ...question, section, marks: 1 };
+      });
       setQuestions(importedQuestions);
       setTitle((current) => current.trim() || payload.title || uploadFile.name.replace(/\.[^.]+$/, ''));
-      const inferredCount = importedQuestions.filter((question) => question.answer_source === 'inferred').length;
+      const missingAnswerCount = importedQuestions.filter((question) => !question.correct_option).length;
       setNotice(
-        `${importedQuestions.length} question${importedQuestions.length === 1 ? '' : 's'} extracted. Review every question and correct answer before publishing.`
+        `${importedQuestions.length} question${importedQuestions.length === 1 ? '' : 's'} parsed. Review the drafts before publishing.`
         + (payload.skippedQuestionNumbers?.length
-          ? ` Skipped ${payload.skippedQuestionNumbers.length} incomplete item${payload.skippedQuestionNumbers.length === 1 ? '' : 's'} from the extraction (items ${payload.skippedQuestionNumbers.join(', ')}); check the source document and add those questions manually if needed.`
+          ? ` Skipped ${payload.skippedQuestionNumbers.length} incomplete item${payload.skippedQuestionNumbers.length === 1 ? '' : 's'} (items ${payload.skippedQuestionNumbers.join(', ')}); check the source document and add them manually if needed.`
           : '')
-        + (inferredCount ? ` ${inferredCount} answer${inferredCount === 1 ? ' was' : 's were'} inferred because the document did not provide an answer key.` : '')
+        + (missingAnswerCount ? ` ${missingAnswerCount} question${missingAnswerCount === 1 ? ' has' : 's have'} no answer in the document; select the correct answer manually.` : '')
       );
     } catch (extractError) {
       setError(extractError.message);
@@ -214,7 +240,7 @@ export default function AdminPage() {
     setNotice('');
 
     if (hasIncompleteQuestionDraft(questions)) {
-      setError('Finish any new section heading, then complete each question, all four options, and its solution before publishing.');
+      setError('Finish any new section heading, then complete each question, all four options, its correct answer, and its solution before publishing.');
       return;
     }
     if (!isFree && !bundleId) {
@@ -500,7 +526,7 @@ export default function AdminPage() {
             </div>
             <div className="question-import">
               <strong>Import questions from a document</strong>
-              <p>Upload a text-based PDF or .docx. Questions, sections, choices, and answer keys will be extracted into editable drafts. Scanned PDFs need OCR first.</p>
+              <p>Upload a text-based PDF or .docx. A deterministic parser reads numbered questions, sections, A-D choices, and any answer keys into editable drafts. Missing answers are left unset, not guessed. Scanned PDFs need OCR first.</p>
               <input
                 className="admin-field"
                 type="file"
@@ -511,10 +537,10 @@ export default function AdminPage() {
               {uploadFile && <small className="question-import-file">{uploadFile.name}</small>}
               <label className="question-import-confirm">
                 <input type="checkbox" checked={uploadAuthorized} onChange={(event) => setUploadAuthorized(event.target.checked)} />
-                I have permission to use this document and send its text to the AI service for extraction.
+                I have permission to use this document. It is processed by the app parser and is not sent to an AI service.
               </label>
               <button className="button button-soft" type="button" disabled={extracting || busy || !uploadFile} onClick={extractQuestions}>
-                {extracting ? 'Extracting questions…' : 'Extract editable questions'}
+                {extracting ? 'Parsing questions…' : 'Parse editable questions'}
               </button>
             </div>
             {questions.map((question, index) => (
@@ -531,7 +557,7 @@ export default function AdminPage() {
                     ? { sectionDraft: '' }
                     : { section: event.target.value, sectionDraft: null })}
                 >
-                  {[...new Set([...sectionChoices, ...questions.map((item) => item.section).filter(Boolean)])].map((choice) => <option key={choice}>{choice}</option>)}
+                  {uniqueSectionChoices([...sectionChoices, ...questions.map((item) => item.section)]).map((choice) => <option key={choice}>{choice}</option>)}
                   <option value={addSectionHeadingOption}>＋ Add section heading…</option>
                 </select>
                 {typeof question.sectionDraft === 'string' && (
@@ -551,7 +577,12 @@ export default function AdminPage() {
                       type="button"
                       disabled={!question.sectionDraft.trim()}
                       onClick={() => changeQuestion(index, {
-                        section: question.sectionDraft.trim(),
+                        section: uniqueSectionChoices([
+                          ...sectionChoices,
+                          ...questions.map((item) => item.section),
+                        ]).find((section) => (
+                          normalizeSectionName(section) === normalizeSectionName(question.sectionDraft)
+                        )) || question.sectionDraft.trim(),
                         sectionDraft: null,
                       })}
                     >
@@ -559,7 +590,7 @@ export default function AdminPage() {
                     </button>
                   </div>
                 )}
-                {question.answer_source === 'inferred' && <small className="question-answer-warning">AI-inferred answer · verify before publishing</small>}
+                {!question.correct_option && <small className="question-answer-warning">No answer key entry found · select the correct answer before publishing</small>}
                 <textarea className="admin-field" aria-label={`Question ${index + 1} text`} rows={2} value={question.question_text} onChange={(event) => changeQuestion(index, { question_text: event.target.value })} placeholder="Write the question…" />
                 <div className="admin-options-grid">
                   {question.options.map((option, optionIndex) => (
@@ -576,6 +607,7 @@ export default function AdminPage() {
                 <div className="admin-inline-fields">
                   <label className="field-label">Correct answer
                     <select className="admin-field" value={question.correct_option} onChange={(event) => changeQuestion(index, { correct_option: event.target.value })}>
+                      <option value="">Choose correct answer</option>
                       {['a', 'b', 'c', 'd'].map((option, optionIndex) => <option value={option} key={option}>Option {String.fromCharCode(65 + optionIndex)}</option>)}
                     </select>
                   </label>
